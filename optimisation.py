@@ -2,6 +2,19 @@ import numpy as np
 import numpy.random as npr
 import numpy.testing as npt
 import scipy.optimize as spo
+from scipy.stats import truncnorm
+from scipy.stats import multivariate_normal
+
+# The following lines suppress the warnings from optimisation
+import warnings
+warnings.filterwarnings("ignore", category=RuntimeWarning) 
+# (note: I make no promises on if this is a good idea,
+# but it saves 30MB output files being full of:
+# /home/bengib/anaconda3/lib/python3.11/site-packages/scipy/optimize/_numdiff.py:576:
+# RuntimeWarning: invalid value encountered in subtract
+#  df = fun(x) - f0
+# Think these just come from having a funny lhd surface.
+# also means output file has up-to-date info DURING run instead of all printed at end.)
 
 def map_from_unit_cube(param_vec, param_limits):
     """
@@ -56,11 +69,12 @@ class OptimisationClass:
         get_emulator_error [function([n_params]) --> array([n_data])] - return emulator error vector
         param_limits [n_params, 2 (lower, upper)] - limits of prior volume
         inverse_data_covariance [n_data, n_data] - inverse of data covariance matrix"""
-    def __init__(self, get_objective, get_emulator_error, param_limits, inverse_data_covariance):
+    def __init__(self, get_objective, get_emulator_error, param_limits, inverse_data_covariance, mvn):
         self.get_objective = get_objective
         self.get_emulator_error = get_emulator_error
         self.param_limits = param_limits
         self.inverse_data_covariance = inverse_data_covariance
+        self.mvn = mvn # multivariate normal used in exploitation
 
     def exploration_weight_GP_UCB(self, nu, delta=0.5):
         """Choose the exploration weight for the GP-UCB acquisition function."""
@@ -72,35 +86,56 @@ class OptimisationClass:
         """Evaluate the exploration term of the GP-UCB acquisition function."""
         emulator_error = self.get_emulator_error(params)
         return self.exploration_weight_GP_UCB(nu, **kwargs) * np.dot(emulator_error,
-                                                                np.dot(self.inverse_data_covariance, emulator_error))
+                                                                     np.dot(self.inverse_data_covariance, emulator_error))
+
+    # The likelihood & posterior used by exploit'n. The Prior is used by both explor'n & exploit'n
+    def lnlike(self, p):
+        return self.mvn.logpdf(p) - self.mvn.logpdf(self.mvn.mean)
+        # 2nd term rm's normalis'n off Gauss. (peaks at 0). 
+
+    def lnprior(self, p):
+        # p in unitary space has values [0,1]                                                                                
+        # just exclude outer 5%:                                                     
+        if p.max() > 0.95 or p.min() < 0.05:
+            return -np.inf
+        return 0.
+
+    def lnprob(self, p):
+        lp = self.lnprior(p)
+        return lp + self.lnlike(p) if np.isfinite(lp) else -np.inf
+
 
     def exploitation_GP_UCB(self, params):
         """Evaluate the exploitation term of the GP-UCB acquisition function."""
-        return self.get_objective(params)
+        return self.lnprob(params) #/ lnprob(mean_gauss) 
 
     def acquisition_GP_UCB(self, params, nu, **kwargs):
         """Evaluate the modified GP-UCB acquisition function."""
-        return self.exploitation_GP_UCB(params) + self.exploration_GP_UCB(params, nu, **kwargs)
+        return -1*(self.exploitation_GP_UCB(params) + self.exploration_GP_UCB(params, nu, **kwargs))
+        # avoid evaluating explor'n if params outside prior (get NaN's in proposal).
+        #exploit = self.exploitation_GP_UCB(params) # this is where the prior gets applied
+        #return -np.inf if not np.isfinite(exploit) else exploit + self.exploration_GP_UCB(params, nu, **kwargs)
 
     def optimise_acquisition_function(self, params_start='default', nu=0.19, acquisition='GP_UCB', bounds='default',
                                       method='TNC', **kwargs):
         """Find parameter vector at maximum of acquisition function."""
         if acquisition == 'GP_UCB':
-            acquisition = lambda params: -1. * self.acquisition_GP_UCB(map_from_unit_cube(params, self.param_limits),
-                                                                       nu, **kwargs)
+            acquisition = lambda params: self.acquisition_GP_UCB(params, nu, **kwargs)
         else:
             raise ValueError('Unsupported acquisition function.')
 
         if bounds == 'default':
-            bounds = [(0.05, 0.95) for _ in range(self.param_limits.shape[0])]
+            bounds = [(0.1, 0.9) for _ in range(self.param_limits.shape[0])]
 
         if params_start == 'default':
             params_start = np.ones(self.param_limits.shape[0]) * 0.5
         else:
             params_start = map_to_unit_cube(params_start, self.param_limits)
 
-        acquisition_max = spo.minimize(acquisition, params_start, method=method, bounds=bounds)
-        return map_from_unit_cube(acquisition_max, self.param_limits)
+        #acquisition_max = spo.minimize(acquisition, params_start, method=method, bounds=bounds).x
+        acquisition_max = spo.basinhopping(acquisition, params_start).x
+        #acquisition_max = spo.shgo(acquisition, bounds=bounds).x #shgo failed to add even 1 node
+        return acquisition_max
 
     def make_proposal(self, params_start='default', nu=0.19, std_dev=None, acquisition='GP_UCB', bounds='default',
                       method='TNC', **kwargs):
@@ -118,15 +153,25 @@ class OptimisationClass:
                                                     exploding outside training set
             method - method for optimisation of acquisition function. See scipy.optimize.minimize. Defaults to truncated
                         Newton method"""
-        if std_dev == None:
-            displacement = np.zeros(self.param_limits.shape[0])
-        else:
-            displacement = npr.normal(scale=std_dev)
+        
         acquisition_max = self.optimise_acquisition_function(params_start=params_start, nu=nu, acquisition=acquisition,
                                                              bounds=bounds, method=method, **kwargs)
-        proposal = acquisition_max + displacement
+        # what's the balance of exploit'n & explor'n at the proposal point? Store this.
+        # the -1 here mimics the -1 which is implemented in the acquisition func above
+        # makes it so acq = -sigma_GP*Sigma_data*sigma_GP + chi^2
+        exploit = -1*self.exploitation_GP_UCB(acquisition_max) 
+        explor = -1*self.exploration_GP_UCB(acquisition_max, nu)
+        
+        if std_dev is None:
+            displacement = np.zeros(len(acquisition_max))
+        else:
+            # make it so the random Gauss is truncated so proposal can never exceed [0,1]:
+            displacement = truncnorm.rvs(a = -1*acquisition_max, b = 1-acquisition_max,
+                                         loc = 0, scale = std_dev, size = len(acquisition_max))
+        proposal = map_from_unit_cube(acquisition_max + displacement, self.param_limits) 
         npt.assert_array_less(proposal, self.param_limits[:, 1],
                               err_msg='Proposal greater than parameter limits -- try again!')
         npt.assert_array_less(self.param_limits[:, 0], proposal,
                               err_msg='Proposal less than parameter limits -- try again!')
-        return proposal
+
+        return proposal, displacement, exploit, explor
